@@ -231,6 +231,8 @@ p <- sample_dilution %>%
 
 ```
 
+Fit model to each depth separately. Don't include intercept because
+we know that the dilution factor is 1 at time 0.
 
 ```{r}
 mods <- sample_dilution %>%
