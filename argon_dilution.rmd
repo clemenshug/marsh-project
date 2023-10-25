@@ -1,0 +1,257 @@
+---
+title: "Untitled"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(powerjoin)
+
+theme_set(theme_light(base_family = "Helvetica"))
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+samples_raw <- read_excel(
+  "argon_concentrations.xlsx",
+  sheet = "samples"
+) %>%
+  separate(
+    sample_id,
+    into = c("plot", "depth", "time_point"),
+    sep = "-",
+    remove = FALSE
+  ) %>%
+  mutate(
+    across(date, as.character),
+    across(
+      plot,
+      \(x) recode(x, TLP = "7")
+    ),
+    across(
+      time_point,
+      \(x) str_replace(x, fixed("TP"), "") %>%
+        recode(`IN` = "0") %>%
+        as.numeric()
+    )
+  )
+
+controls_raw <- read_excel(
+  "argon_concentrations.xlsx",
+  sheet = "controls"
+) %>%
+  mutate(
+    across(
+      control_type,
+      \(x) recode(x, AMBIENT = "ambient", `Spike (Initial)` = "spike")
+    ),
+    across(date, as.character)
+  ) %>%
+  separate(
+    sample_id,
+    into = c("plot", "depth", "x"),
+    sep = "-",
+    remove = FALSE
+  ) %>%
+  mutate(
+    across(
+      plot,
+      \(x) recode(x, TLP = "7")
+    )
+  ) %>%
+  select(-x)
+```
+
+
+```{r}
+controls <- controls_raw %>%
+  select(-sample_id) %>%
+  pivot_longer(
+    cols = c(`28`, `29`, `30`, Ar),
+    names_to = "species",
+    values_to = "concentration"
+  ) %>%
+  # This is just to add missing ambient controls and
+  # replace their values with the mean of controls
+  # at the same date and plot
+  bind_rows(
+    anti_join(
+      samples_raw %>%
+        pivot_longer(
+          cols = c(Ar),
+          names_to = "species",
+          values_to = "concentration"
+        ) %>%
+        distinct(date, plot, depth, species) %>%
+        crossing(
+          control_type = c("ambient", "spike")
+        ),
+      .,
+      by = c("date", "plot", "depth", "species", "control_type")
+    )
+  ) %>%
+  group_by(date, plot, control_type, species) %>%
+  mutate(
+    across(
+      concentration,
+      \(x) replace_na(x, mean(x, na.rm = TRUE))
+    )
+  ) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from = control_type,
+    values_from = concentration
+  )
+
+sample_dilution <- samples_raw %>%
+  pivot_longer(
+    cols = c(Ar),
+    names_to = "species",
+    values_to = "concentration"
+  ) %>%
+  power_left_join(
+    controls,
+    by = c("date", "plot", "depth", "species"),
+    check = check_specs(
+      duplicate_keys_left = "ignore",
+      unmatched_keys_left = "warn",
+      duplicate_keys_right = "warn",
+      unmatched_keys_right = "warn"
+    ),
+    suffix = c("_samle", "_control")
+  ) %>%
+  mutate(
+    dilution_factor = (spike - ambient) / (concentration - ambient),
+    fraction_remaining = 1 / dilution_factor
+  )
+
+```
+
+```{r}
+p <- sample_dilution %>%
+  ggplot(
+    aes(
+      hr,
+      dilution_factor,
+      color = date,
+      group = paste0(date, plot, depth)
+    )
+  ) +
+  geom_point() +
+  geom_line() +
+  labs(
+    x = "Time (hours)",
+    y = "Dilution factor",
+    color = "Date"
+  )
+
+p <- sample_dilution %>%
+  mutate(
+    across(
+      depth,
+      \(x) fct_inseq(as.character(x), ordered = TRUE)
+    )
+  ) %>%
+  ggplot(
+    aes(
+      hr,
+      dilution_factor,
+      color = depth,
+      group = paste0(date, plot, depth)
+    )
+  ) +
+  geom_smooth(
+    aes(
+      group = depth
+    ),
+    method = "lm"
+    # se = FALSE
+  ) +
+  geom_point(alpha = 0.5) +
+  geom_line(alpha = 0.5) +
+  coord_cartesian(
+    ylim = c(0.5, 10)
+  ) +
+  labs(
+    x = "Time (hours)",
+    y = "Dilution factor",
+    color = "Depth (cm)"
+  ) +
+  facet_wrap(~depth)
+
+ggsave(
+  "dilution_factor_by_depth.pdf",
+  p, width = 7, height = 5
+)
+```
+
+```{r}
+
+p <- sample_dilution %>%
+  mutate(
+    across(
+      depth,
+      \(x) fct_inseq(as.character(x), ordered = TRUE)
+    )
+  ) %>%
+  ggplot(
+    aes(
+      hr,
+      fraction_remaining,
+      color = depth,
+      group = paste0(date, plot, depth)
+    )
+  ) +
+  geom_smooth(
+    aes(
+      group = depth
+    ),
+    method = "lm"
+    # se = FALSE
+  ) +
+  geom_point(alpha = 0.5) +
+  geom_line(alpha = 0.5) +
+  scale_y_continuous(
+    labels = scales::percent_format()
+  ) +
+  coord_cartesian(
+    ylim = c(0, 1)
+  ) +
+  labs(
+    x = "Time (hours)",
+    y = "Percent remaining",
+    color = "Depth (cm)"
+  ) +
+  facet_wrap(~depth)
+
+
+```
+
+
+```{r}
+mods <- sample_dilution %>%
+  group_by(depth) %>%
+  summarize(
+    mod = lm(
+      I(dilution_factor - 1) ~ 0 + hr,
+      data = cur_data()
+    ) %>%
+      broom::tidy() %>%
+      list(),
+    .groups = "drop"
+  ) %>%
+  unnest(mod)
+
+```
+
+# A tibble: 4 × 6
+  depth term  estimate std.error statistic      p.value
+  <chr> <chr>    <dbl>     <dbl>     <dbl>        <dbl>
+1 10    hr       0.978    0.122       8.04 0.0000000121
+2 15    hr       0.988    0.214       4.61 0.0000649   
+3 20    hr       0.917    0.232       3.95 0.00335     
+4 5     hr       0.443    0.0731      6.06 0.00000355  
